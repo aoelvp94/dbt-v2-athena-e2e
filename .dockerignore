@@ -1,0 +1,16 @@
+.git
+.github
+.cache
+.venv
+results
+build
+infra/.state
+infra/terraform/.terraform
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.*
+infra/terraform/*.tfplan
+project/target
+project/logs
+project/dbt_packages
+project/.user.yml
+**/.DS_Store

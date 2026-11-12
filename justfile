@@ -49,6 +49,8 @@ check:
 
 # up, then the suite, then down, then status. down and status still run when the suite fails.
 cycle:
+    #!/usr/bin/env bash
+    set -euo pipefail
     "{{ root }}/infra/up.sh"
     test_status=0
     "{{ root }}/scripts/run_e2e.sh" || test_status=$?
@@ -56,6 +58,45 @@ cycle:
     "{{ root }}/infra/down.sh" || down_status=$?
     status_status=0
     "{{ root }}/infra/status.sh" || status_status=$?
+    if [[ "$test_status" -ne 0 ]]; then exit "$test_status"; fi
+    if [[ "$down_status" -ne 0 ]]; then exit "$down_status"; fi
+    exit "$status_status"
+
+# Build the pinned image. versions.env is the pin list; an exported pin overrides it.
+docker-build:
+    "{{ root }}/scripts/docker_build.sh"
+
+# Create the sandbox in the image. AWS keys are passed through the environment.
+docker-up:
+    "{{ root }}/scripts/docker_run.sh" /opt/e2e/infra/up.sh
+
+# Run the suite in the image. Extra words go to scripts/run_e2e.sh.
+docker-test *args:
+    "{{ root }}/scripts/docker_run.sh" /opt/e2e/scripts/run_e2e.sh {{ args }}
+
+# Parse, ls, and init in the image. Does not contact AWS.
+docker-test-offline:
+    "{{ root }}/scripts/docker_run.sh" just test-offline
+
+# Delete harness resources from the image. Fails if any remain.
+docker-down:
+    "{{ root }}/scripts/docker_run.sh" /opt/e2e/infra/down.sh
+
+# List harness resources from the image.
+docker-status:
+    "{{ root }}/scripts/docker_run.sh" /opt/e2e/infra/status.sh
+
+# up, then the suite, then down, then status, in the image. down and status still run when the suite fails.
+docker-cycle:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    "{{ root }}/scripts/docker_run.sh" /opt/e2e/infra/up.sh
+    test_status=0
+    "{{ root }}/scripts/docker_run.sh" /opt/e2e/scripts/run_e2e.sh || test_status=$?
+    down_status=0
+    "{{ root }}/scripts/docker_run.sh" /opt/e2e/infra/down.sh || down_status=$?
+    status_status=0
+    "{{ root }}/scripts/docker_run.sh" /opt/e2e/infra/status.sh || status_status=$?
     if [[ "$test_status" -ne 0 ]]; then exit "$test_status"; fi
     if [[ "$down_status" -ne 0 ]]; then exit "$down_status"; fi
     exit "$status_status"

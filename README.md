@@ -9,7 +9,11 @@ Repeatable sandbox for the Athena adapter work in [dbt-labs/dbt](https://github.
 cargo install just
 # or a prebuilt binary:
 curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to "$HOME/.local/bin"
+```
 
+`just check` also needs [uv](https://docs.astral.sh/uv/) at the version in [`versions.env`](versions.env). Copy `/uv` and `/uvx` out of `ghcr.io/astral-sh/uv` at that tag, or run `curl -LsSf https://astral.sh/uv/<version>/install.sh | sh`. Python dependencies are declared in `pyproject.toml` and locked in `uv.lock`. The scripts run them with `uv run`.
+
+```bash
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 export AWS_REGION=us-east-1   # optional
@@ -189,12 +193,35 @@ just build --driver-branch aoelvp94/athena/local/driver-combined
 
 `just test-offline` (`./scripts/run_e2e.sh --offline`) runs parse, ls, and init. It needs a binary. Without `infra/up.sh`, live checks are reported as failed and no AWS call is made.
 
-`just check` (`./scripts/check.sh`) runs shellcheck, `terraform fmt -check`, `terraform validate` via the dry-run, and the cost self-test. It does not contact AWS. `just down-dry-run` prints the destroy calls and does not contact AWS.
+`just check` (`./scripts/check.sh`) runs shellcheck, the pin check, `uv lock --check`, `terraform fmt -check`, `terraform validate` via the dry-run, and the cost self-test. It does not contact AWS. `just down-dry-run` prints the destroy calls and does not contact AWS.
+
+## Docker
+
+The image is `linux/amd64`. Every pin is a key in [`versions.env`](versions.env), and the `Dockerfile` `ARG` defaults are the same values (`scripts/check_pins.sh` fails if they drift). `just docker-build` passes that file as build args. Export a key first to override one pin (`DBT_SHA=... just docker-build`).
+
+```bash
+just docker-build
+just docker-up
+just docker-test
+just docker-down
+just docker-status
+just docker-test-offline
+just docker-cycle    # up, test, down, status; down and status still run if test fails
+```
+
+`CARGO_BUILD_JOBS` defaults to 1. uv is copied from the pinned `ghcr.io/astral-sh/uv` image, then `uv sync --frozen` installs `uv.lock`. The build checks out the pinned dbt commit and the pinned driver main, merges driver PRs #20, #19, and #22, and fails if any of those heads moved. AWS keys are passed only with `docker -e` (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_DEFAULT_REGION`, plus `AWS_REGION`). They are not stored in the image or in a file. `results/`, `project/`, `infra/terraform/`, and `infra/.state/` are mounted from the host so `up` and `down` share Terraform state. The container process uses your uid.
+
+Provenance is `/opt/e2e/BUILD_INFO.json`. The same pins are OCI labels. `scripts/run_e2e.sh` copies that file into `results/<timestamp>/` and records the dbt sha, driver sha, and uv version in `summary.md` and `summary.json`.
+
+GitHub Actions (`.github/workflows/image-contract.yml`) checks the pins and `uv.lock`. It does not build the image and does not push one. A release build with `CARGO_BUILD_JOBS=1` does not fit a GitHub-hosted runner's time or memory. Build the image on the machine that will run the suite.
 
 ## Layout
 
 ```
 justfile                  recipe wrappers; scripts stay the source of truth
+versions.env              image pins (also the Dockerfile ARG defaults)
+Dockerfile                multi-stage build of the pinned engine and driver
+pyproject.toml uv.lock    Python project; scripts use uv run
 infra/up.sh infra/down.sh infra/status.sh
 infra/terraform/          local Terraform state, gitignored
 infra/iam-least-privilege.json

@@ -61,6 +61,9 @@ build_mode="pull-requests"
 dbt_branch_spec="${DBT_BRANCH:-}"
 # Same value as --driver-branch. Example: aoelvp94/athena/local/driver-combined
 driver_branch_spec="${DRIVER_BRANCH:-}"
+expect_commit=""
+expect_driver_main=""
+expect_driver_pr=()
 
 usage() {
   cat <<'EOF'
@@ -82,6 +85,13 @@ usage: scripts/build_dbt.sh [options]
   --driver-branch SPEC
                      Build this driver ref instead of merging driver PRs.
                      Same SPEC shape as --branch. Env: DRIVER_BRANCH.
+  --expect-commit SHA
+                     With --branch, fail unless that checkout is this SHA
+  --expect-driver-main SHA
+                     Fail unless the fetched driver main is this SHA
+  --expect-driver-pr N:SHA
+                     Fail unless driver PR N's head is this SHA. Repeat
+                     for every driver PR being merged.
   --binary PATH      Use this dbt binary and skip the Rust build
   --driver-lib PATH  Use this libadbc_driver_athena.so and skip the Go build
   --cache-dir PATH   Default: .cache/dbt-v2-athena-e2e
@@ -118,6 +128,18 @@ while [[ $# -gt 0 ]]; do
     --driver-branch)
       [[ $# -ge 2 ]] || { echo "error: --driver-branch needs <remote>/<branch>" >&2; exit 1; }
       driver_branch_spec="$2"; shift 2 ;;
+    --expect-commit)
+      [[ $# -ge 2 ]] || { echo "error: --expect-commit needs a SHA" >&2; exit 1; }
+      [[ "$2" =~ ^[0-9a-f]{40}$ ]] || { echo "error: --expect-commit needs a 40-character SHA" >&2; exit 1; }
+      expect_commit="$2"; shift 2 ;;
+    --expect-driver-main)
+      [[ $# -ge 2 ]] || { echo "error: --expect-driver-main needs a SHA" >&2; exit 1; }
+      [[ "$2" =~ ^[0-9a-f]{40}$ ]] || { echo "error: --expect-driver-main needs a 40-character SHA" >&2; exit 1; }
+      expect_driver_main="$2"; shift 2 ;;
+    --expect-driver-pr)
+      [[ $# -ge 2 ]] || { echo "error: --expect-driver-pr needs N:SHA" >&2; exit 1; }
+      [[ "$2" =~ ^[0-9]+:[0-9a-f]{40}$ ]] || { echo "error: --expect-driver-pr needs N:SHA (40 hex digits)" >&2; exit 1; }
+      expect_driver_pr+=("$2"); shift 2 ;;
     --self-test) self_test=1; shift ;;
     --cache-dir)
       [[ $# -ge 2 ]] || { echo "error: --cache-dir needs a path" >&2; exit 1; }
@@ -151,6 +173,16 @@ if [[ "$stock_driver" -eq 1 || -n "$driver_branch_spec" ]]; then
 else
   DRIVER_PRS=("${DEFAULT_DRIVER_PRS[@]}")
 fi
+if [[ -n "$expect_commit" && -z "$dbt_branch_spec" ]]; then
+  echo "error: --expect-commit requires --branch" >&2
+  exit 1
+fi
+if [[ -n "$expect_driver_main" || ${#expect_driver_pr[@]} -gt 0 ]]; then
+  if [[ "$skip_driver" -eq 1 || -n "$driver_branch_spec" ]]; then
+    echo "error: driver SHA pins apply to driver main plus the --driver-prs merge. Drop --driver-branch and --skip-driver." >&2
+    exit 1
+  fi
+fi
 
 mkdir -p "$CACHE_DIR" "${ROOT}/build"
 REPORT="${ROOT}/build/merge-report.json"
@@ -164,6 +196,14 @@ need_cmd() {
 
 need_cmd git
 need_cmd jq
+
+run_python() {
+  command -v uv >/dev/null 2>&1 || {
+    echo "error: uv is required. Install the version pinned in versions.env from ghcr.io/astral-sh/uv. Python packages in this harness are installed with uv." >&2
+    exit 1
+  }
+  uv run --frozen --project "$ROOT" python "$@"
+}
 
 gitc() {
   local dir="$1"
@@ -200,7 +240,7 @@ merge_ref() {
   fi
   files="$(gitc "$dir" diff --name-only --diff-filter=U | paste -sd, - || true)"
   if [[ "$mode" == "driver" ]]; then
-    if python3 "${SCRIPT_DIR}/resolve_driver_conflicts.py" "$dir"; then
+    if run_python "${SCRIPT_DIR}/resolve_driver_conflicts.py" "$dir"; then
       gitc "$dir" add -u
       gitc "$dir" commit --no-edit >/dev/null
       json_list "$pr" "resolved-patch" "$files"
@@ -345,7 +385,7 @@ branch_self_test() {
   assert_branch_spec_rejects "https://github.com/aoelvp94/dbt"
   assert_branch_spec_rejects ""
   echo "branch spec self-test ok"
-  python3 "${SCRIPT_DIR}/resolve_driver_conflicts.py" --self-test
+  run_python "${SCRIPT_DIR}/resolve_driver_conflicts.py" --self-test
 }
 
 checkout_remote_branch() {
@@ -393,6 +433,49 @@ series_needs_attention() {
   jq -e 'map(select(.status != "clean" and .status != "already-present" and .status != "resolved-patch")) | length > 0' >/dev/null <<<"$json"
 }
 
+assert_expected_driver_prs() {
+  local spec num want got found pr
+  if [[ ${#expect_driver_pr[@]} -eq 0 ]]; then
+    return 0
+  fi
+  if [[ ${#DRIVER_PRS[@]} -eq 0 ]]; then
+    echo "error: --expect-driver-pr was set but no driver PRs are being merged" >&2
+    exit 1
+  fi
+  for spec in "${expect_driver_pr[@]}"; do
+    num="${spec%%:*}"
+    found=0
+    for pr in "${DRIVER_PRS[@]}"; do
+      if [[ "$pr" == "$num" ]]; then
+        found=1
+      fi
+    done
+    if [[ "$found" -eq 0 ]]; then
+      echo "error: --expect-driver-pr ${num} is not in the driver PR list" >&2
+      exit 1
+    fi
+  done
+  for num in "${DRIVER_PRS[@]}"; do
+    found=0
+    for spec in "${expect_driver_pr[@]}"; do
+      if [[ "${spec%%:*}" != "$num" ]]; then
+        continue
+      fi
+      found=1
+      want="${spec#*:}"
+      got="$(gitc "$DRIVER_SRC" rev-parse "refs/pullheads/${num}^{commit}")"
+      if [[ "$got" != "$want" ]]; then
+        echo "error: driver PR ${num} is ${got}, expected ${want}" >&2
+        exit 1
+      fi
+    done
+    if [[ "$found" -eq 0 ]]; then
+      echo "error: driver PR ${num} has no --expect-driver-pr pin" >&2
+      exit 1
+    fi
+  done
+}
+
 ensure_dbt_repo() {
   prepare_repo "$DBT_SRC" "$DBT_REPO"
   fetch_prs "$DBT_SRC" "${DBT_PRS[@]}" "${USER_LISTED_PRS[@]}" 16376 16274
@@ -428,6 +511,10 @@ if [[ "$build_mode" == "branch" ]]; then
   echo "checking out ${BRANCH_REMOTE} branch ${BRANCH_NAME}"
   checkout_remote_branch "$DBT_SRC" "$BRANCH_URL" "$BRANCH_NAME"
   dbt_commit="$(gitc "$DBT_SRC" rev-parse HEAD)"
+  if [[ -n "$expect_commit" && "$dbt_commit" != "$expect_commit" ]]; then
+    echo "error: ${BRANCH_REMOTE} ${BRANCH_NAME} is ${dbt_commit}, expected ${expect_commit}" >&2
+    exit 1
+  fi
 else
   echo "fetching dbt-labs/dbt and pull heads"
   ensure_dbt_repo
@@ -478,6 +565,11 @@ elif [[ "$skip_driver" -eq 0 ]]; then
   echo "fetching dbt-labs/athena"
   ensure_driver_repo
   driver_main="$(gitc "$DRIVER_SRC" rev-parse origin/main)"
+  if [[ -n "$expect_driver_main" && "$driver_main" != "$expect_driver_main" ]]; then
+    echo "error: driver main is ${driver_main}, expected ${expect_driver_main}" >&2
+    exit 1
+  fi
+  assert_expected_driver_prs
   if [[ ${#DRIVER_PRS[@]} -gt 0 ]]; then
     for pr in "${DRIVER_PRS[@]}"; do
       echo "probe driver PR ${pr} onto main"
@@ -644,20 +736,25 @@ if [[ -n "$binary_path" ]]; then
   echo "using existing binary ${binary_path}"
 else
   need_cmd curl
-  export RUSTUP_HOME="${CACHE_DIR}/rustup"
-  export CARGO_HOME="${CACHE_DIR}/cargo"
+  export RUSTUP_HOME="${RUSTUP_HOME:-${CACHE_DIR}/rustup}"
+  export CARGO_HOME="${CARGO_HOME:-${CACHE_DIR}/cargo}"
+  rust_version="${RUST_VERSION:-1.96.0}"
   if [[ ! -x "${CARGO_HOME}/bin/rustup" ]]; then
+    if [[ "${E2E_REQUIRE_TOOLCHAIN:-}" == "1" ]]; then
+      echo "error: rustup is not installed under ${CARGO_HOME} and E2E_REQUIRE_TOOLCHAIN=1" >&2
+      exit 1
+    fi
     curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
-      | sh -s -- -y --default-toolchain 1.96.0 --profile minimal --no-modify-path
+      | sh -s -- -y --default-toolchain "$rust_version" --profile minimal --no-modify-path
   fi
   # shellcheck disable=SC1091
   source "${CARGO_HOME}/env"
-  rustup toolchain install 1.96.0 --profile minimal -c rustfmt -c clippy
+  rustup toolchain install "$rust_version" --profile minimal -c rustfmt -c clippy
   # Release LTO of dbt-schemas OOMs when cargo schedules many jobs on a 15 GiB host.
   if [[ -z "${CARGO_BUILD_JOBS:-}" ]]; then
     export CARGO_BUILD_JOBS=1
   fi
-  echo "compiling dbt (CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} cargo build --release -p dbt-sa-cli --bin dbt)"
+  echo "compiling dbt (rust ${rust_version}, CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}, cargo build --release -p dbt-sa-cli --bin dbt)"
   cargo build --manifest-path "${DBT_SRC}/Cargo.toml" --release -p dbt-sa-cli --bin dbt
   cp "${DBT_SRC}/target/release/dbt" "${DIST}/dbt"
   chmod +x "${DIST}/dbt"
@@ -671,6 +768,10 @@ elif [[ "$skip_driver" -eq 0 ]]; then
   gomod="${DRIVER_SRC}/go/go.mod"
   go_need="$(sed -n 's/^go //p' "$gomod" | head -n 1)"
   if ! command -v go >/dev/null 2>&1 || ! go version | grep -q "go${go_need}"; then
+    if [[ "${E2E_REQUIRE_TOOLCHAIN:-}" == "1" ]]; then
+      echo "error: Go ${go_need} is not on PATH and E2E_REQUIRE_TOOLCHAIN=1" >&2
+      exit 1
+    fi
     sdk="${CACHE_DIR}/go-sdk"
     tarball="${CACHE_DIR}/go${go_need}.linux-amd64.tar.gz"
     if [[ ! -x "${sdk}/bin/go" ]] || ! "${sdk}/bin/go" version | grep -q "go${go_need}"; then

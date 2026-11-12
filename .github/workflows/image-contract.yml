@@ -1,0 +1,42 @@
+# The release image is built locally with `just docker-build`.
+# Release LTO of dbt at CARGO_BUILD_JOBS=1 exceeds GitHub-hosted runner time and memory.
+name: image-contract
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Check versions.env against the Dockerfile
+        run: ./scripts/check_pins.sh
+
+      - name: Check uv.lock with the pinned uv image
+        run: |
+          set -euo pipefail
+          set -a
+          # shellcheck disable=SC1091
+          source versions.env
+          set +a
+          docker pull "$UV_IMAGE"
+          cid="$(docker create "$UV_IMAGE")"
+          docker cp "$cid":/uv /tmp/uv
+          docker rm "$cid" >/dev/null
+          chmod +x /tmp/uv
+          /tmp/uv lock --check
+
+      - name: Skip the image build
+        run: |
+          echo "Skipping the Docker image build."
+          echo "The image compiles dbt v2 with release LTO and CARGO_BUILD_JOBS=1."
+          echo "That does not fit a GitHub-hosted runner's time or memory."
+          echo "Build it locally with: just docker-build"

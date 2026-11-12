@@ -20,6 +20,7 @@ usage: scripts/run_e2e.sh [--offline] [--binary PATH]
 
 Writes results/<UTC timestamp>/summary.md and summary.json.
 Each check is mapped to the pull request it exercises.
+Copies BUILD_INFO.json into that directory when the image or the repo has one.
 EOF
 }
 
@@ -50,6 +51,11 @@ fi
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 RESULTS="${ROOT}/results/${stamp}"
 mkdir -p "$RESULTS"
+if [[ -f /opt/e2e/BUILD_INFO.json ]]; then
+  cp /opt/e2e/BUILD_INFO.json "${RESULTS}/BUILD_INFO.json"
+elif [[ -f "${ROOT}/BUILD_INFO.json" ]]; then
+  cp "${ROOT}/BUILD_INFO.json" "${RESULTS}/BUILD_INFO.json"
+fi
 START_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 START_EPOCH="$(date +%s)"
 
@@ -372,6 +378,10 @@ if [[ "$method" != "athena-api" ]]; then
 fi
 
 finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+build_info_json="null"
+if [[ -f "${RESULTS}/BUILD_INFO.json" ]]; then
+  build_info_json="$(jq -c . "${RESULTS}/BUILD_INFO.json")"
+fi
 jq -n \
   --arg started_at "$START_ISO" \
   --arg finished_at "$finished" \
@@ -385,6 +395,7 @@ jq -n \
   --argjson queries "$queries" \
   --arg method "$method" \
   --arg note "$api_note" \
+  --argjson build_info "$build_info_json" \
   '{
     started_at: $started_at,
     finished_at: $finished_at,
@@ -392,6 +403,7 @@ jq -n \
     profiles_dir: $profiles,
     failed_checks: $failed,
     checks: $checks,
+    build_info: $build_info,
     bytes_scanned: $bytes_scanned,
     billed_bytes: $billed_bytes,
     estimated_cost_usd: $cost,
@@ -411,6 +423,10 @@ jq -n \
   echo
   echo "Binary: \`${binary_path:-not found}\`"
   echo
+  if [[ -f "${RESULTS}/BUILD_INFO.json" ]]; then
+    echo "Provenance: \`BUILD_INFO.json\` (dbt \`$(jq -r '.dbt.sha' "${RESULTS}/BUILD_INFO.json")\`, driver \`$(jq -r '.driver.base_sha' "${RESULTS}/BUILD_INFO.json")\`, uv \`$(jq -r '.uv.version' "${RESULTS}/BUILD_INFO.json")\`)."
+    echo
+  fi
   echo "Profiles: \`${profiles_dir}\`"
   echo
   echo "| Check | Result | Pull requests | Seconds | Detail |"

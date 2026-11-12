@@ -1,0 +1,8 @@
+version = 1
+revision = 5
+requires-python = ">=3.12"
+
+[[package]]
+name = "dbt-v2-athena-e2e"
+version = "0.0.0"
+source = { virtual = "." }

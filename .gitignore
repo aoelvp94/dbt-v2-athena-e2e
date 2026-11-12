@@ -18,6 +18,9 @@ infra/.state/
 # dbt checkout, Rust/Go toolchains, binary, driver
 .cache/
 
+# uv project environment
+.venv/
+
 # Merge report from scripts/build_dbt.sh
 build/
 

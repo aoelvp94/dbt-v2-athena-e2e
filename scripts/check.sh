@@ -16,6 +16,7 @@ need shellcheck
 need terraform
 need jq
 need bash
+need uv
 
 echo "shellcheck"
 shellcheck -x -P "${ROOT}/infra" -P "${ROOT}/scripts" \
@@ -27,13 +28,25 @@ shellcheck -x -P "${ROOT}/infra" -P "${ROOT}/scripts" \
   "${ROOT}/scripts/build_dbt.sh" \
   "${ROOT}/scripts/run_e2e.sh" \
   "${ROOT}/scripts/cost.sh" \
-  "${ROOT}/scripts/check.sh"
+  "${ROOT}/scripts/check.sh" \
+  "${ROOT}/scripts/pins.sh" \
+  "${ROOT}/scripts/check_pins.sh" \
+  "${ROOT}/scripts/docker_build.sh" \
+  "${ROOT}/scripts/docker_run.sh" \
+  "${ROOT}/scripts/write_build_info.sh" \
+  "${ROOT}/scripts/container_entrypoint.sh"
 
 echo "jq iam policy"
 jq -e . "${ROOT}/infra/iam-least-privilege.json" >/dev/null
 
 echo "cost self-test"
 "${ROOT}/scripts/cost.sh" --self-test
+
+echo "image pins"
+"${ROOT}/scripts/check_pins.sh"
+
+echo "uv lock"
+(cd "$ROOT" && uv lock --check)
 
 echo "build_dbt branch parser"
 "${ROOT}/scripts/build_dbt.sh" --self-test
