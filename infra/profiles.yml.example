@@ -1,0 +1,16 @@
+# Example Athena profile for offline parse/ls. infra/up.sh writes a real one to
+# infra/.state/profiles.yml from Terraform outputs. Do not put access keys here:
+# the driver uses the AWS default credential chain.
+dbt_v2_athena_e2e:
+  target: dev
+  outputs:
+    dev:
+      type: athena
+      region_name: us-east-1
+      s3_staging_dir: s3://aoelvp94-dbt-athena-test-example-us-east-1/athena-results/
+      s3_data_dir: s3://aoelvp94-dbt-athena-test-example-us-east-1/data/
+      s3_data_naming: schema_table_unique
+      schema: aoelvp94_dbt_athena_test_example_us_east_1_analytics
+      database: awsdatacatalog
+      work_group: aoelvp94-dbt-athena-test-example-us-east-1
+      threads: 1
