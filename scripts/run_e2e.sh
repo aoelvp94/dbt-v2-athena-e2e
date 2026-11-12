@@ -343,59 +343,32 @@ billed=0
 cost="0.00000000"
 queries=0
 method="none"
-artifact_files=()
-shopt -s nullglob
-artifact_files=("${RESULTS}"/run_results_*.json)
-shopt -u nullglob
-if [[ ${#artifact_files[@]} -gt 0 ]]; then
-  read -r scanned billed cost queries method < <("${SCRIPT_DIR}/cost.sh" "${artifact_files[@]}")
-fi
-
 api_note=""
 work_group=""
 if [[ -f "${ROOT}/infra/.state/e2e.env" ]]; then
   work_group="$(sed -n 's/^E2E_WORK_GROUP=//p' "${ROOT}/infra/.state/e2e.env" | tail -n 1)"
 fi
+# GetQueryExecution is primary. run_results.json has no data_scanned_in_bytes.
 if [[ "$offline_only" -eq 0 && -n "$work_group" && -n "${AWS_ACCESS_KEY_ID:-}${AWS_PROFILE:-}" ]] && command -v aws >/dev/null 2>&1; then
-  ids_file="${RESULTS}/query-ids.txt"
-  if aws athena list-query-executions --work-group "$work_group" --max-results 50 --output text --query 'QueryExecutionIds' >"$ids_file" 2>"${RESULTS}/athena-list.err"; then
-    : >"${RESULTS}/athena-queries.ndjson"
-    kept=0
-    # list-query-executions prints ids on one line, tab or space separated, newest first.
-    for qid in $(tr '\t' ' ' <"$ids_file"); do
-      [[ -n "$qid" && "$qid" != "None" ]] || continue
-      qjson="${RESULTS}/qe-${qid}.json"
-      if ! aws athena get-query-execution --query-execution-id "$qid" --output json >"$qjson" 2>>"${RESULTS}/athena-list.err"; then
-        rm -f "$qjson"
-        continue
-      fi
-      submitted="$(jq -r '.QueryExecution.Status.SubmissionDateTime' "$qjson")"
-      sub_epoch="$(date -u -d "$submitted" +%s 2>/dev/null || echo 0)"
-      if [[ "$sub_epoch" -lt "$START_EPOCH" ]]; then
-        rm -f "$qjson"
-        break
-      fi
-      kept=$((kept + 1))
-      if [[ "$kept" -ge 80 ]]; then
-        break
-      fi
-    done
-    shopt -s nullglob
-    api_files=("${RESULTS}"/qe-*.json)
-    shopt -u nullglob
-    if [[ ${#api_files[@]} -gt 0 ]]; then
-      read -r scanned billed cost queries method < <("${SCRIPT_DIR}/cost.sh" "${api_files[@]}")
-      method="athena-api"
-      api_note="Athena GetQueryExecution for workgroup ${work_group} since ${START_ISO}."
-    fi
+  if read -r scanned billed cost queries method < <("${SCRIPT_DIR}/cost.sh" --from-work-group "$work_group" --since-epoch "$START_EPOCH" --cache-dir "$RESULTS"); then
+    api_note="Athena list-query-executions and GetQueryExecution for workgroup ${work_group} since ${START_ISO}. 10 MiB minimum per successful DML query."
   else
-    api_note="Athena query listing failed; cost uses dbt artifacts when they carry byte counts."
+    api_note="Athena query listing failed; falling back to dbt run_results.json, which does not include data_scanned_in_bytes."
+    method="none"
   fi
 fi
-
-if [[ "$method" == "artifact" && "$queries" -eq 0 ]]; then
-  method="none"
-  api_note="${api_note} No query byte counts were found in run_results. A driver without statistics metadata leaves bytes at 0, and DDL is not billed."
+if [[ "$method" != "athena-api" ]]; then
+  artifact_files=()
+  shopt -s nullglob
+  artifact_files=("${RESULTS}"/run_results_*.json)
+  shopt -u nullglob
+  if [[ ${#artifact_files[@]} -gt 0 ]]; then
+    read -r scanned billed cost queries method < <("${SCRIPT_DIR}/cost.sh" "${artifact_files[@]}")
+  fi
+  if [[ "$queries" -eq 0 ]]; then
+    method="none"
+    api_note="${api_note} No query byte counts were found in run_results. A driver without statistics metadata leaves bytes at 0, and DDL is not billed."
+  fi
 fi
 
 finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -446,7 +419,7 @@ jq -n \
   echo
   echo "Bytes scanned (reported): ${scanned}"
   echo
-  echo "Billed bytes (10 MiB minimum per successful non-DDL query, rounded up to 1 MiB): ${billed}"
+  echo "Billed bytes (10 MiB minimum per successful DML query, rounded up to 1 MiB): ${billed}"
   echo
   echo "Estimated cost at US\$5 per TB (10^12 bytes): US\$${cost}"
   echo

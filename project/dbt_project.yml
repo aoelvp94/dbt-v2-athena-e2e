@@ -38,6 +38,7 @@ models:
         +format: parquet
         +partitioned_by:
           - order_date
+        # classification is not a Hive TBLPROPERTIES key Athena accepts in CTAS WITH.
         +table_properties:
-          classification: "'parquet'"
+          write_compression: "'SNAPPY'"
         +force_batch: true

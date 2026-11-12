@@ -14,7 +14,7 @@ models:
               arguments:
                 values: ['placed', 'shipped']
   - name: orders_hive
-    description: Hive table partitioned by order_date, with table_properties and force_batch set in dbt_project.yml.
+    description: Hive table partitioned by order_date. table_properties is write_compression SNAPPY, and force_batch is set in dbt_project.yml.
     columns:
       - name: order_id
         tests: [unique, not_null]

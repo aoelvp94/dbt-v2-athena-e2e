@@ -6,7 +6,7 @@
     table_type='iceberg',
     format='parquet',
     partitioned_by=['order_date'],
-    table_properties={'write_target_data_file_size_bytes': "'1048576'"}
+    table_properties={'write_target_data_file_size_bytes': 1048576}
 ) }}
 
 select

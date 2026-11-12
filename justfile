@@ -15,9 +15,9 @@ default:
 build *args:
     "{{ root }}/scripts/build_dbt.sh" {{ args }}
 
-# Build aoelvp94/dbt local/athena-combined and the driver from dbt-labs/athena main.
+# Build aoelvp94/dbt local/athena-combined plus driver main with #20, #19, and #22.
 build-combined:
-    "{{ root }}/scripts/build_dbt.sh" --branch aoelvp94/dbt/local/athena-combined
+    "{{ root }}/scripts/build_dbt.sh" --branch aoelvp94/dbt/local/athena-combined --driver-prs "20 19 22"
 
 # Create the sandbox and write profiles.yml.
 up:

@@ -8,7 +8,7 @@
     format='parquet',
     partitioned_by=['order_date'],
     force_batch=true,
-    table_properties={'classification': "'parquet'"}
+    table_properties={'write_compression': "'SNAPPY'"}
 ) }}
 
 with src as (
