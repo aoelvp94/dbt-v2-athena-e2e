@@ -133,6 +133,13 @@ RUN git config --global --add safe.directory '*' \
       --expect-driver-pr "19:${DRIVER_PR_19_SHA}" \
       --expect-driver-pr "22:${DRIVER_PR_22_SHA}"
 
+# dbt-state's protoc include path is its proto/ directory. Well-known types
+# live in libprotobuf-dev, so expose them as proto/google.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libprotobuf-dev \
+ && rm -rf /var/lib/apt/lists/* \
+ && ln -sfn /usr/include/google /src/.cache/dbt-v2-athena-e2e/dbt-src/crates/dbt-state/proto/google
+
 RUN --mount=type=cache,target=/opt/cargo/registry,sharing=locked \
     --mount=type=cache,target=/opt/cargo/git,sharing=locked \
     --mount=type=cache,target=/src/.cache/dbt-v2-athena-e2e/dbt-src/target,sharing=locked \
