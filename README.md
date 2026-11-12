@@ -1,19 +1,40 @@
 # dbt v2 Athena end-to-end harness
 
-Repeatable sandbox for the Athena adapter work in [dbt-labs/dbt](https://github.com/dbt-labs/dbt) (the Rust engine, formerly dbt Fusion). From a Linux machine with AWS keys in the environment:
+Repeatable sandbox for the Athena adapter work in [dbt-labs/dbt](https://github.com/dbt-labs/dbt) (the Rust engine, formerly dbt Fusion). From a Linux machine with AWS keys in the environment.
+
+[just](https://github.com/casey/just) is the entry point. Recipes in the `justfile` only call the scripts, which stay the source of truth. The justfile exports `AWS_REGION` and defaults it to `us-east-1`.
 
 ```bash
+# https://github.com/casey/just#installation
+cargo install just
+# or a prebuilt binary:
+curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to "$HOME/.local/bin"
+
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
-export AWS_REGION=us-east-1   # optional; this is the default
+export AWS_REGION=us-east-1   # optional
 
+just            # list recipes
+just build
+just up
+just test
+just down
+just cycle      # up, test, down, status; down and status still run if test fails
+```
+
+Other recipes: `build-combined`, `test-offline`, `down-dry-run`, `status`, `check`. Extra words are passed through to the script (`just build --merge-only`, `just test --offline`).
+
+The same steps without just:
+
+```bash
+export AWS_REGION=us-east-1   # optional; the scripts default to us-east-1
 ./scripts/build_dbt.sh
 ./infra/up.sh
 ./scripts/run_e2e.sh
 ./infra/down.sh
 ```
 
-`up` is idempotent. `down` is safe to run twice and exits non-zero if anything tagged `project=dbt-v2-athena-e2e` or named with the harness prefix is still there. `./infra/status.sh` lists what exists. None of the scripts write access keys to disk.
+`up` is idempotent. `down` is safe to run twice and exits non-zero if anything tagged `project=dbt-v2-athena-e2e` or named with the harness prefix is still there. `just status` (`./infra/status.sh`) lists what exists. None of the scripts write access keys to disk.
 
 The project under `project/` is synthetic and public: a handful of orders, no employer data, no proprietary names. Every query is a few kilobytes of data.
 
@@ -138,6 +159,10 @@ The engine needs Rust **1.96** (`rust-toolchain.toml`). The script installs that
 To build one already-combined branch, pass `--branch <owner>/<repo>/<branch>` or set `DBT_BRANCH` to that same spec. The branch name may contain slashes. For the combined Athena tree, that spec is `aoelvp94/dbt/local/athena-combined`: the script checks out [aoelvp94/dbt](https://github.com/aoelvp94/dbt) `local/athena-combined` and builds the Go driver from `dbt-labs/athena` `main`, with no driver pull requests:
 
 ```bash
+just build-combined
+# same thing:
+just build -- --branch aoelvp94/dbt/local/athena-combined
+
 ./scripts/build_dbt.sh --branch aoelvp94/dbt/local/athena-combined
 # same thing:
 DBT_BRANCH=aoelvp94/dbt/local/athena-combined ./scripts/build_dbt.sh
@@ -146,19 +171,25 @@ DBT_BRANCH=aoelvp94/dbt/local/athena-combined ./scripts/build_dbt.sh
 `https://github.com/aoelvp94/dbt/local/athena-combined` and `git@github.com:aoelvp94/dbt.git/local/athena-combined` are accepted too. `--prs`, `--no-execution`, `--allow-resolved`, and `--driver-prs` do not apply in this mode. The report is still `build/merge-report.json`, with `"mode": "branch"` and the checked-out commit.
 
 ```bash
+just build -- --merge-only           # report only
+just build -- --binary /path/to/dbt  # existing engine binary, still build the driver
+just build -- --no-execution         # stack without Part 6
+just build-combined
+
 ./scripts/build_dbt.sh --merge-only          # report only
 ./scripts/build_dbt.sh --binary /path/to/dbt # existing engine binary, still build the driver
 ./scripts/build_dbt.sh --no-execution        # stack without Part 6
 ./scripts/build_dbt.sh --branch aoelvp94/dbt/local/athena-combined
 ```
 
-`./scripts/run_e2e.sh --offline` runs parse, ls, and init. It needs a binary. Without `infra/up.sh`, live checks are reported as failed and no AWS call is made.
+`just test-offline` (`./scripts/run_e2e.sh --offline`) runs parse, ls, and init. It needs a binary. Without `infra/up.sh`, live checks are reported as failed and no AWS call is made.
 
-`./scripts/check.sh` runs shellcheck, `terraform fmt -check`, `terraform validate` via the dry-run, and the cost self-test. It does not contact AWS.
+`just check` (`./scripts/check.sh`) runs shellcheck, `terraform fmt -check`, `terraform validate` via the dry-run, and the cost self-test. It does not contact AWS. `just down-dry-run` prints the destroy calls and does not contact AWS.
 
 ## Layout
 
 ```
+justfile                  recipe wrappers; scripts stay the source of truth
 infra/up.sh infra/down.sh infra/status.sh
 infra/terraform/          local Terraform state, gitignored
 infra/iam-least-privilege.json
