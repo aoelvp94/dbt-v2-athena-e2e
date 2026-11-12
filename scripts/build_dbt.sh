@@ -23,6 +23,11 @@
 # A conflict is recorded. The stack merge retries with -X theirs (the PR
 # wins conflicting hunks). Compilation waits until every requested merge is
 # clean, unless --allow-resolved is set.
+#
+# --branch <remote>/<branch> (or DBT_BRANCH) skips that merge. It checks out
+# the given ref and builds it. The intended tree is aoelvp94/dbt branch
+# local/athena-combined. The Go driver then comes from dbt-labs/athena main,
+# with no driver pull requests.
 
 set -euo pipefail
 
@@ -46,6 +51,11 @@ skip_driver=0
 binary_path=""
 driver_lib=""
 custom_prs=""
+driver_prs_explicit=0
+self_test=0
+build_mode="pull-requests"
+# Same value as --branch. Example: aoelvp94/dbt/local/athena-combined
+dbt_branch_spec="${DBT_BRANCH:-}"
 
 usage() {
   cat <<'EOF'
@@ -55,12 +65,18 @@ usage: scripts/build_dbt.sh [options]
   --allow-resolved   Compile even if a merge needed -X theirs
   --no-execution     Drop engine PR 16376 (Part 6) from the default stack
   --prs "N N ..."    Engine PR numbers, in merge order, instead of the default
+  --branch SPEC      Build SPEC instead of merging pull requests
+                     SPEC is <owner>/<repo>/<branch> (branch may contain
+                     slashes) or an https/git URL with the branch after the
+                     repo. Example: aoelvp94/dbt/local/athena-combined
+                     Env: DBT_BRANCH. The driver is dbt-labs/athena main.
   --stock-driver     Build the driver from main, with no driver PRs
   --driver-prs "N.." Driver PR numbers to merge onto the driver main
   --binary PATH      Use this dbt binary and skip the Rust build
   --driver-lib PATH  Use this libadbc_driver_athena.so and skip the Go build
   --cache-dir PATH   Default: .cache/dbt-v2-athena-e2e
   --force            Re-merge and rebuild even when the stamp matches
+  --self-test        Check --branch parsing and exit
 EOF
 }
 
@@ -83,8 +99,13 @@ while [[ $# -gt 0 ]]; do
       custom_prs="$2"; shift 2 ;;
     --driver-prs)
       [[ $# -ge 2 ]] || { echo "error: --driver-prs needs a list" >&2; exit 1; }
+      driver_prs_explicit=1
       # shellcheck disable=SC2206
       DEFAULT_DRIVER_PRS=($2); shift 2 ;;
+    --branch)
+      [[ $# -ge 2 ]] || { echo "error: --branch needs <remote>/<branch>" >&2; exit 1; }
+      dbt_branch_spec="$2"; shift 2 ;;
+    --self-test) self_test=1; shift ;;
     --cache-dir)
       [[ $# -ge 2 ]] || { echo "error: --cache-dir needs a path" >&2; exit 1; }
       CACHE_DIR="$2"; shift 2 ;;
@@ -100,6 +121,14 @@ elif [[ "$no_execution" -eq 1 ]]; then
   DBT_PRS=(16274 16365 16367 16368 16369 16374 16370 16375)
 else
   DBT_PRS=("${DEFAULT_DBT_PRS[@]}")
+fi
+if [[ -n "$dbt_branch_spec" ]]; then
+  if [[ -n "$custom_prs" || "$no_execution" -eq 1 || "$allow_resolved" -eq 1 || "$driver_prs_explicit" -eq 1 ]]; then
+    echo "error: --branch checks out that ref and builds the driver from dbt-labs/athena main. Drop --prs, --no-execution, --allow-resolved, and --driver-prs." >&2
+    exit 1
+  fi
+  build_mode="branch"
+  stock_driver=1
 fi
 if [[ "$stock_driver" -eq 1 ]]; then
   DRIVER_PRS=()
@@ -170,9 +199,142 @@ prepare_repo() {
   local url="$2"
   if [[ ! -d "${dir}/.git" ]]; then
     git clone --filter=blob:none --no-tags "$url" "$dir"
+  else
+    gitc "$dir" remote set-url origin "$url"
   fi
   gitc "$dir" fetch --no-tags origin main
   gitc "$dir" checkout --force -B e2e-base origin/main
+}
+
+# path is owner/repo[.git]/branch (branch may contain slashes). Prints
+# owner, repo, branch on three lines.
+split_owner_repo_branch() {
+  local path="${1%/}"
+  local owner repo branch rest
+  if [[ "$path" != */*/* ]]; then
+    return 1
+  fi
+  owner="${path%%/*}"
+  rest="${path#*/}"
+  repo="${rest%%/*}"
+  branch="${rest#*/}"
+  repo="${repo%.git}"
+  if [[ -z "$owner" || -z "$repo" || -z "$branch" ]]; then
+    return 1
+  fi
+  printf '%s\n%s\n%s\n' "$owner" "$repo" "$branch"
+}
+
+# Prints JSON: {"url","remote","branch"}. remote is owner/repo.
+parse_branch_spec() {
+  local spec="$1"
+  local host path parsed owner repo branch url
+  if [[ -z "$spec" || "$spec" == *" "* ]]; then
+    echo "error: --branch expects <owner>/<repo>/<branch> or <url>/<branch>" >&2
+    return 1
+  fi
+  if [[ "$spec" =~ ^https?:// ]]; then
+    local without="${spec#*://}"
+    host="${without%%/*}"
+    path="${without#*/}"
+    if [[ -z "$host" || "$host" == "$without" ]]; then
+      echo "error: --branch URL is missing a repository path: ${spec}" >&2
+      return 1
+    fi
+    parsed="$(split_owner_repo_branch "$path")" || {
+      echo "error: --branch URL must be <url>/<owner>/<repo>/<branch>: ${spec}" >&2
+      return 1
+    }
+    {
+      read -r owner
+      read -r repo
+      read -r branch
+    } <<<"$parsed"
+    url="https://${host}/${owner}/${repo}.git"
+  elif [[ "$spec" == git@* ]]; then
+    local hostpath="${spec#git@}"
+    host="${hostpath%%:*}"
+    path="${hostpath#*:}"
+    if [[ -z "$host" || "$host" == "$hostpath" ]]; then
+      echo "error: --branch git URL is missing a repository path: ${spec}" >&2
+      return 1
+    fi
+    parsed="$(split_owner_repo_branch "$path")" || {
+      echo "error: --branch git URL must be git@host:owner/repo/<branch>: ${spec}" >&2
+      return 1
+    }
+    {
+      read -r owner
+      read -r repo
+      read -r branch
+    } <<<"$parsed"
+    url="git@${host}:${owner}/${repo}.git"
+  else
+    parsed="$(split_owner_repo_branch "$spec")" || {
+      echo "error: --branch expects <owner>/<repo>/<branch> (the branch may contain slashes). Example: aoelvp94/dbt/local/athena-combined" >&2
+      return 1
+    }
+    {
+      read -r owner
+      read -r repo
+      read -r branch
+    } <<<"$parsed"
+    url="https://github.com/${owner}/${repo}.git"
+  fi
+  jq -nc --arg url "$url" --arg remote "${owner}/${repo}" --arg branch "$branch" \
+    '{url: $url, remote: $remote, branch: $branch}'
+}
+
+assert_branch_spec() {
+  local spec="$1" want_url="$2" want_remote="$3" want_branch="$4" got
+  got="$(parse_branch_spec "$spec")"
+  jq -e --arg url "$want_url" --arg remote "$want_remote" --arg branch "$want_branch" \
+    '.url == $url and .remote == $remote and .branch == $branch' >/dev/null <<<"$got" || {
+    echo "error: branch spec parsed wrong: ${spec} -> ${got}" >&2
+    return 1
+  }
+}
+
+assert_branch_spec_rejects() {
+  local spec="$1"
+  if parse_branch_spec "$spec" >/dev/null 2>&1; then
+    echo "error: branch spec should have been rejected: ${spec}" >&2
+    return 1
+  fi
+}
+
+branch_self_test() {
+  local url="https://github.com/aoelvp94/dbt.git"
+  local remote="aoelvp94/dbt"
+  local branch="local/athena-combined"
+  assert_branch_spec "aoelvp94/dbt/local/athena-combined" "$url" "$remote" "$branch"
+  assert_branch_spec "https://github.com/aoelvp94/dbt/local/athena-combined" "$url" "$remote" "$branch"
+  assert_branch_spec "https://github.com/aoelvp94/dbt.git/local/athena-combined" "$url" "$remote" "$branch"
+  assert_branch_spec "git@github.com:aoelvp94/dbt.git/local/athena-combined" \
+    "git@github.com:aoelvp94/dbt.git" "$remote" "$branch"
+  assert_branch_spec "git@github.com:aoelvp94/dbt/local/athena-combined" \
+    "git@github.com:aoelvp94/dbt.git" "$remote" "$branch"
+  assert_branch_spec_rejects "local/athena-combined"
+  assert_branch_spec_rejects "aoelvp94/dbt"
+  assert_branch_spec_rejects "https://github.com/aoelvp94/dbt"
+  assert_branch_spec_rejects ""
+  echo "branch spec self-test ok"
+}
+
+checkout_remote_branch() {
+  local dir="$1"
+  local url="$2"
+  local branch="$3"
+  if [[ ! -d "${dir}/.git" ]]; then
+    git clone --filter=blob:none --no-tags "$url" "$dir"
+  fi
+  gitc "$dir" remote set-url origin "$url"
+  echo "fetching ${url} branch ${branch}"
+  if ! gitc "$dir" fetch --no-tags origin "refs/heads/${branch}:refs/remotes/origin/${branch}"; then
+    echo "error: could not fetch ${url} refs/heads/${branch}" >&2
+    exit 1
+  fi
+  gitc "$dir" checkout --force -B e2e-branch "refs/remotes/origin/${branch}"
 }
 
 fetch_prs() {
@@ -216,32 +378,55 @@ ensure_driver_repo() {
   fi
 }
 
-echo "fetching dbt-labs/dbt and pull heads"
-ensure_dbt_repo
+if [[ "$self_test" -eq 1 ]]; then
+  branch_self_test
+  exit 0
+fi
 
+BRANCH_URL=""
+BRANCH_REMOTE=""
+BRANCH_NAME=""
+dbt_commit=""
 onto_items="[]"
+stack_json="[]"
+user_json="[]"
+noexec_json="[]"
 pr=""
-for pr in "${DBT_PRS[@]}"; do
-  echo "probe engine PR ${pr} onto main"
-  item="$(merge_series "$DBT_SRC" probe "$pr")"
-  # merge_series returns an array of one object
-  onto_items="$(jq -c --argjson item "$item" '. += $item' <<<"$onto_items")"
-done
 
-echo "merging engine stack: ${DBT_PRS[*]}"
-stack_json="$(merge_series "$DBT_SRC" stack "${DBT_PRS[@]}")"
-# Keep the stack checkout. merge_series leaves e2e-series on the result.
-gitc "$DBT_SRC" branch -f e2e-stack HEAD
+if [[ "$build_mode" == "branch" ]]; then
+  parsed="$(parse_branch_spec "$dbt_branch_spec")" || exit 1
+  BRANCH_URL="$(jq -r '.url' <<<"$parsed")"
+  BRANCH_REMOTE="$(jq -r '.remote' <<<"$parsed")"
+  BRANCH_NAME="$(jq -r '.branch' <<<"$parsed")"
+  echo "checking out ${BRANCH_REMOTE} branch ${BRANCH_NAME}"
+  checkout_remote_branch "$DBT_SRC" "$BRANCH_URL" "$BRANCH_NAME"
+  dbt_commit="$(gitc "$DBT_SRC" rev-parse HEAD)"
+else
+  echo "fetching dbt-labs/dbt and pull heads"
+  ensure_dbt_repo
 
-echo "merging the user-listed PR set onto main"
-user_json="$(merge_series "$DBT_SRC" stack "${USER_LISTED_PRS[@]}")"
+  for pr in "${DBT_PRS[@]}"; do
+    echo "probe engine PR ${pr} onto main"
+    item="$(merge_series "$DBT_SRC" probe "$pr")"
+    # merge_series returns an array of one object
+    onto_items="$(jq -c --argjson item "$item" '. += $item' <<<"$onto_items")"
+  done
 
-without_exec=(16274 16365 16367 16368 16369 16374 16370 16375)
-echo "merging the stack without Part 6 (#16376)"
-noexec_json="$(merge_series "$DBT_SRC" stack "${without_exec[@]}")"
+  echo "merging engine stack: ${DBT_PRS[*]}"
+  stack_json="$(merge_series "$DBT_SRC" stack "${DBT_PRS[@]}")"
+  # Keep the stack checkout. merge_series leaves e2e-series on the result.
+  gitc "$DBT_SRC" branch -f e2e-stack HEAD
 
-# Restore the default stack for a possible compile.
-gitc "$DBT_SRC" checkout --force e2e-stack >/dev/null
+  echo "merging the user-listed PR set onto main"
+  user_json="$(merge_series "$DBT_SRC" stack "${USER_LISTED_PRS[@]}")"
+
+  without_exec=(16274 16365 16367 16368 16369 16374 16370 16375)
+  echo "merging the stack without Part 6 (#16376)"
+  noexec_json="$(merge_series "$DBT_SRC" stack "${without_exec[@]}")"
+
+  # Restore the default stack for a possible compile.
+  gitc "$DBT_SRC" checkout --force e2e-stack >/dev/null
+fi
 
 driver_onto="[]"
 driver_stack="[]"
@@ -265,36 +450,64 @@ if [[ "$skip_driver" -eq 0 ]]; then
   fi
 fi
 
-dbt_main="$(gitc "$DBT_SRC" rev-parse origin/main)"
-jq -n \
-  --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  --arg dbt_main "$dbt_main" \
-  --arg driver_main "$driver_main" \
-  --argjson dbt_prs "$(printf '%s\n' "${DBT_PRS[@]}" | jq -R . | jq -s 'map(tonumber)')" \
-  --argjson onto "$onto_items" \
-  --argjson stack "$stack_json" \
-  --argjson user_listed "$user_json" \
-  --argjson without_execution "$noexec_json" \
-  --argjson driver_onto "$driver_onto" \
-  --argjson driver_stack "$driver_stack" \
-  '{
-    generated_at: $generated_at,
-    dbt: {
-      repo: "dbt-labs/dbt",
-      main: $dbt_main,
-      merge_order: $dbt_prs,
-      onto_main: $onto,
-      stack: $stack,
-      user_listed_stack: $user_listed,
-      stack_without_execution: $without_execution
-    },
-    driver: {
-      repo: "dbt-labs/athena",
-      main: $driver_main,
-      onto_main: $driver_onto,
-      stack: $driver_stack
-    }
-  }' >"$REPORT"
+if [[ "$build_mode" == "branch" ]]; then
+  jq -n \
+    --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg url "$BRANCH_URL" \
+    --arg remote "$BRANCH_REMOTE" \
+    --arg branch "$BRANCH_NAME" \
+    --arg commit "$dbt_commit" \
+    --arg driver_main "$driver_main" \
+    '{
+      generated_at: $generated_at,
+      mode: "branch",
+      dbt: {
+        repo: $remote,
+        url: $url,
+        branch: $branch,
+        commit: $commit
+      },
+      driver: {
+        repo: "dbt-labs/athena",
+        main: $driver_main,
+        source: "main",
+        onto_main: [],
+        stack: []
+      }
+    }' >"$REPORT"
+else
+  dbt_main="$(gitc "$DBT_SRC" rev-parse origin/main)"
+  jq -n \
+    --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg dbt_main "$dbt_main" \
+    --arg driver_main "$driver_main" \
+    --argjson dbt_prs "$(printf '%s\n' "${DBT_PRS[@]}" | jq -R . | jq -s 'map(tonumber)')" \
+    --argjson onto "$onto_items" \
+    --argjson stack "$stack_json" \
+    --argjson user_listed "$user_json" \
+    --argjson without_execution "$noexec_json" \
+    --argjson driver_onto "$driver_onto" \
+    --argjson driver_stack "$driver_stack" \
+    '{
+      generated_at: $generated_at,
+      mode: "pull-requests",
+      dbt: {
+        repo: "dbt-labs/dbt",
+        main: $dbt_main,
+        merge_order: $dbt_prs,
+        onto_main: $onto,
+        stack: $stack,
+        user_listed_stack: $user_listed,
+        stack_without_execution: $without_execution
+      },
+      driver: {
+        repo: "dbt-labs/athena",
+        main: $driver_main,
+        onto_main: $driver_onto,
+        stack: $driver_stack
+      }
+    }' >"$REPORT"
+fi
 echo "wrote ${REPORT}"
 
 stack_bad=0
@@ -311,7 +524,11 @@ if [[ "$merge_only" -eq 1 ]]; then
     echo "merge report has conflicts or -X theirs resolutions; not compiling (--merge-only)" >&2
     exit 2
   fi
-  echo "merges are clean"
+  if [[ "$build_mode" == "branch" ]]; then
+    echo "checked out ${BRANCH_REMOTE} ${BRANCH_NAME} at ${dbt_commit}; driver is dbt-labs/athena main"
+  else
+    echo "merges are clean"
+  fi
   exit 0
 fi
 

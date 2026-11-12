@@ -101,6 +101,7 @@ Resources, all tagged `project=dbt-v2-athena-e2e`:
 - Hive `insert_overwrite` incremental and an Iceberg `merge` incremental
 - a unit test with row fixtures and no explicit column types (the schema-inference path)
 - a singular test that order 99 exists after the second run
+- `accepted_values` written as `arguments.values`. Current dbt main rejects a top-level `values:` key on a generic test. Tests that take no arguments (`unique`, `not_null`) stay as names.
 
 The second run is `dbt run --vars '{include_late_order: true}'`. After the first run, `dbt compile` of the incremental models must contain the marker `e2e_is_incremental`, which is only rendered when `is_incremental()` is true.
 
@@ -134,10 +135,21 @@ The Go driver is [dbt-labs/athena](https://github.com/dbt-labs/athena), built wi
 
 The engine needs Rust **1.96** (`rust-toolchain.toml`). The script installs that toolchain under `.cache/` without changing the system default. The driver `go.mod` asks for Go **1.26.10**; the script downloads that SDK into the cache when the system Go is older. Build products stay in `.cache/dbt-v2-athena-e2e/`.
 
+To build one already-combined branch, pass `--branch <owner>/<repo>/<branch>` or set `DBT_BRANCH` to that same spec. The branch name may contain slashes. For the combined Athena tree, that spec is `aoelvp94/dbt/local/athena-combined`: the script checks out [aoelvp94/dbt](https://github.com/aoelvp94/dbt) `local/athena-combined` and builds the Go driver from `dbt-labs/athena` `main`, with no driver pull requests:
+
+```bash
+./scripts/build_dbt.sh --branch aoelvp94/dbt/local/athena-combined
+# same thing:
+DBT_BRANCH=aoelvp94/dbt/local/athena-combined ./scripts/build_dbt.sh
+```
+
+`https://github.com/aoelvp94/dbt/local/athena-combined` and `git@github.com:aoelvp94/dbt.git/local/athena-combined` are accepted too. `--prs`, `--no-execution`, `--allow-resolved`, and `--driver-prs` do not apply in this mode. The report is still `build/merge-report.json`, with `"mode": "branch"` and the checked-out commit.
+
 ```bash
 ./scripts/build_dbt.sh --merge-only          # report only
 ./scripts/build_dbt.sh --binary /path/to/dbt # existing engine binary, still build the driver
 ./scripts/build_dbt.sh --no-execution        # stack without Part 6
+./scripts/build_dbt.sh --branch aoelvp94/dbt/local/athena-combined
 ```
 
 `./scripts/run_e2e.sh --offline` runs parse, ls, and init. It needs a binary. Without `infra/up.sh`, live checks are reported as failed and no AWS call is made.

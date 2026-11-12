@@ -7,9 +7,12 @@ models:
       - name: order_id
         tests: [unique, not_null]
       - name: status
+        # dbt main rejects top-level generic-test arguments. `values` belongs
+        # under `arguments:`, same as any other test that takes arguments.
         tests:
           - accepted_values:
-              values: ['placed', 'shipped']
+              arguments:
+                values: ['placed', 'shipped']
   - name: orders_hive
     description: Hive table partitioned by order_date, with table_properties and force_batch set in dbt_project.yml.
     columns:

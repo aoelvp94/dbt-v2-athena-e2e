@@ -35,6 +35,9 @@ jq -e . "${ROOT}/infra/iam-least-privilege.json" >/dev/null
 echo "cost self-test"
 "${ROOT}/scripts/cost.sh" --self-test
 
+echo "build_dbt branch parser"
+"${ROOT}/scripts/build_dbt.sh" --self-test
+
 echo "terraform fmt"
 terraform -chdir="${ROOT}/infra/terraform" fmt -check -recursive -diff
 
