@@ -1,0 +1,32 @@
+version: 2
+
+models:
+  - name: stg_orders
+    description: View of placed and shipped orders. The unit test below uses row fixtures so Athena infers the schema from the query instead of a zero-row CTAS.
+    columns:
+      - name: order_id
+        tests: [unique, not_null]
+      - name: status
+        tests:
+          - accepted_values:
+              values: ['placed', 'shipped']
+  - name: orders_hive
+    description: Hive table partitioned by order_date, with table_properties and force_batch set in dbt_project.yml.
+    columns:
+      - name: order_id
+        tests: [unique, not_null]
+  - name: orders_iceberg
+    description: Iceberg table partitioned by order_date.
+    columns:
+      - name: order_id
+        tests: [unique, not_null]
+  - name: orders_incremental_hive
+    description: Hive insert_overwrite model. The second compile contains the e2e_is_incremental marker.
+    columns:
+      - name: order_id
+        tests: [unique, not_null]
+  - name: orders_incremental_iceberg
+    description: Iceberg merge on order_id. The second run inserts order 99.
+    columns:
+      - name: order_id
+        tests: [unique, not_null]

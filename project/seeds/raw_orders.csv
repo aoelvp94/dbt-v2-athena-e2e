@@ -1,0 +1,4 @@
+order_id,customer_id,status,amount_cents,order_date
+1,10,placed,1299,2024-01-15
+2,11,shipped,2599,2024-01-16
+3,10,cancelled,499,2024-02-02

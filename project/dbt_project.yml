@@ -1,0 +1,43 @@
+# Synthetic public project for the dbt v2 Athena end-to-end harness.
+# No employer data and no proprietary names.
+
+name: dbt_v2_athena_e2e
+version: "1.0.0"
+profile: dbt_v2_athena_e2e
+
+flags:
+  send_anonymous_usage_stats: false
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+clean-targets:
+  - target
+  - dbt_packages
+  - logs
+
+vars:
+  # The second dbt run passes include_late_order: true so the Iceberg merge
+  # inserts order 99. The default keeps a single run idempotent.
+  include_late_order: false
+
+seeds:
+  dbt_v2_athena_e2e:
+    +quote_columns: false
+
+models:
+  dbt_v2_athena_e2e:
+    staging:
+      +materialized: view
+    marts:
+      # +partitioned_by, +table_properties and +force_batch are the keys
+      # dbt parse used to reject (UnusedConfigKey / SerializationError).
+      orders_hive:
+        +materialized: table
+        +table_type: hive
+        +format: parquet
+        +partitioned_by:
+          - order_date
+        +table_properties:
+          classification: "'parquet'"
+        +force_batch: true

@@ -1,0 +1,23 @@
+version: 2
+
+seeds:
+  - name: raw_customers
+    description: Two public customer rows.
+    columns:
+      - name: customer_id
+        tests: [unique, not_null]
+      - name: customer_name
+        tests: [not_null]
+  - name: raw_orders
+    description: Three public order rows. One row is cancelled and dropped by stg_orders.
+    columns:
+      - name: order_id
+        tests: [unique, not_null]
+      - name: customer_id
+        tests: [not_null]
+      - name: status
+        tests: [not_null]
+      - name: amount_cents
+        tests: [not_null]
+      - name: order_date
+        tests: [not_null]
