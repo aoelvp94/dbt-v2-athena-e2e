@@ -1,0 +1,407 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+#
+# Build a dbt v2 binary from dbt-labs/dbt main plus the Athena pull requests,
+# and build the dbt-labs/athena Go ADBC driver (cd go/pkg && make).
+#
+# Merge order for the engine (each head is refs/pull/N/head):
+#   16274  Part 1  AthenaDbConfig profile schema (required; #16375 is built on it)
+#   16365  Part 0  Backend::Athena entrypoint and athena.output_location
+#   16367  Part 2  parse-path todo!() arms
+#   16368  Part 3  partitioned_by / table_properties / force_batch
+#   16369  Part 4  vendored dbt-athena 1.11.0 macros
+#   16374  Part 5  AthenaMetadataAdapter and athena_get_relation
+#   16376  Part 6  adapter methods the macros call (omit with --no-execution)
+#   16370  Part 8  unit tests on Athena
+#   16375  Part 9  dbt init wizard (its branch already contains #16274)
+#
+# The driver on main does not yet accept the options and operations those
+# engine PRs send. Driver PRs, merged in this order unless --stock-driver:
+#   20  connection options (assume role, retries, poll interval)
+#   19  Glue / S3 / STS operations
+#   22  query statistics in the result schema
+# A conflict is recorded. The stack merge retries with -X theirs (the PR
+# wins conflicting hunks). Compilation waits until every requested merge is
+# clean, unless --allow-resolved is set.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+DBT_REPO="${DBT_REPO:-https://github.com/dbt-labs/dbt.git}"
+DRIVER_REPO="${DRIVER_REPO:-https://github.com/dbt-labs/athena.git}"
+CACHE_DIR="${CACHE_DIR:-${ROOT}/.cache/dbt-v2-athena-e2e}"
+
+DEFAULT_DBT_PRS=(16274 16365 16367 16368 16369 16374 16376 16370 16375)
+USER_LISTED_PRS=(16365 16367 16368 16369 16374 16370 16375)
+DEFAULT_DRIVER_PRS=(20 19 22)
+
+merge_only=0
+allow_resolved=0
+no_execution=0
+stock_driver=0
+force=0
+skip_driver=0
+binary_path=""
+driver_lib=""
+custom_prs=""
+
+usage() {
+  cat <<'EOF'
+usage: scripts/build_dbt.sh [options]
+
+  --merge-only       Fetch and merge, write the report, do not compile
+  --allow-resolved   Compile even if a merge needed -X theirs
+  --no-execution     Drop engine PR 16376 (Part 6) from the default stack
+  --prs "N N ..."    Engine PR numbers, in merge order, instead of the default
+  --stock-driver     Build the driver from main, with no driver PRs
+  --driver-prs "N.." Driver PR numbers to merge onto the driver main
+  --binary PATH      Use this dbt binary and skip the Rust build
+  --driver-lib PATH  Use this libadbc_driver_athena.so and skip the Go build
+  --cache-dir PATH   Default: .cache/dbt-v2-athena-e2e
+  --force            Re-merge and rebuild even when the stamp matches
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --merge-only) merge_only=1; shift ;;
+    --allow-resolved) allow_resolved=1; shift ;;
+    --no-execution) no_execution=1; shift ;;
+    --stock-driver) stock_driver=1; shift ;;
+    --force) force=1; shift ;;
+    --skip-driver) skip_driver=1; shift ;;
+    --binary)
+      [[ $# -ge 2 ]] || { echo "error: --binary needs a path" >&2; exit 1; }
+      binary_path="$2"; shift 2 ;;
+    --driver-lib)
+      [[ $# -ge 2 ]] || { echo "error: --driver-lib needs a path" >&2; exit 1; }
+      driver_lib="$2"; shift 2 ;;
+    --prs)
+      [[ $# -ge 2 ]] || { echo "error: --prs needs a list" >&2; exit 1; }
+      custom_prs="$2"; shift 2 ;;
+    --driver-prs)
+      [[ $# -ge 2 ]] || { echo "error: --driver-prs needs a list" >&2; exit 1; }
+      # shellcheck disable=SC2206
+      DEFAULT_DRIVER_PRS=($2); shift 2 ;;
+    --cache-dir)
+      [[ $# -ge 2 ]] || { echo "error: --cache-dir needs a path" >&2; exit 1; }
+      CACHE_DIR="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "error: unknown argument: $1" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+if [[ -n "$custom_prs" ]]; then
+  # shellcheck disable=SC2206
+  DBT_PRS=($custom_prs)
+elif [[ "$no_execution" -eq 1 ]]; then
+  DBT_PRS=(16274 16365 16367 16368 16369 16374 16370 16375)
+else
+  DBT_PRS=("${DEFAULT_DBT_PRS[@]}")
+fi
+if [[ "$stock_driver" -eq 1 ]]; then
+  DRIVER_PRS=()
+else
+  DRIVER_PRS=("${DEFAULT_DRIVER_PRS[@]}")
+fi
+
+mkdir -p "$CACHE_DIR" "${ROOT}/build"
+REPORT="${ROOT}/build/merge-report.json"
+DIST="${CACHE_DIR}/dist"
+DBT_SRC="${CACHE_DIR}/dbt-src"
+DRIVER_SRC="${CACHE_DIR}/athena-src"
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || { echo "error: required command not found: $1" >&2; exit 1; }
+}
+
+need_cmd git
+need_cmd jq
+
+gitc() {
+  local dir="$1"
+  shift
+  git -C "$dir" -c user.name='dbt-v2-athena-e2e' -c user.email='aoelvp94@gmail.com' "$@"
+}
+
+json_list() {
+  local pr status files="$3"
+  pr="$1"
+  status="$2"
+  jq -nc --arg pr "$pr" --arg status "$status" --arg files "$files" \
+    '{pr: ($pr | tonumber), status: $status, files: (if $files == "" then [] else ($files | split(",")) end)}'
+}
+
+# Merge one ref. Prints a JSON object. Leaves the worktree on the merge result
+# when the merge is kept. mode=probe aborts on conflict. mode=stack retries
+# with -X theirs.
+merge_ref() {
+  local dir="$1"
+  local ref="$2"
+  local pr="$3"
+  local mode="$4"
+  local files=""
+
+  if gitc "$dir" merge-base --is-ancestor "$ref" HEAD; then
+    json_list "$pr" "already-present" ""
+    return 0
+  fi
+  if gitc "$dir" merge --no-ff --no-edit "$ref" >/dev/null 2>&1; then
+    json_list "$pr" "clean" ""
+    return 0
+  fi
+  files="$(gitc "$dir" diff --name-only --diff-filter=U | paste -sd, - || true)"
+  gitc "$dir" merge --abort >/dev/null 2>&1 || gitc "$dir" reset --hard HEAD >/dev/null
+  if [[ "$mode" == "stack" ]]; then
+    if gitc "$dir" merge -X theirs --no-ff --no-edit "$ref" >/dev/null 2>&1; then
+      json_list "$pr" "resolved-theirs" "$files"
+      return 0
+    fi
+    gitc "$dir" merge --abort >/dev/null 2>&1 || gitc "$dir" reset --hard HEAD >/dev/null
+  fi
+  json_list "$pr" "failed" "$files"
+  return 0
+}
+
+prepare_repo() {
+  local dir="$1"
+  local url="$2"
+  if [[ ! -d "${dir}/.git" ]]; then
+    git clone --filter=blob:none --no-tags "$url" "$dir"
+  fi
+  gitc "$dir" fetch --no-tags origin main
+  gitc "$dir" checkout --force -B e2e-base origin/main
+}
+
+fetch_prs() {
+  local dir="$1"
+  shift
+  local pr
+  for pr in "$@"; do
+    gitc "$dir" fetch --no-tags origin "refs/pull/${pr}/head:refs/pullheads/${pr}"
+  done
+}
+
+# Run a series of merges from origin/main. Prints a JSON array.
+merge_series() {
+  local dir="$1"
+  local mode="$2"
+  shift 2
+  gitc "$dir" merge --abort >/dev/null 2>&1 || true
+  gitc "$dir" checkout --force -B e2e-series origin/main >/dev/null
+  local pr item array="[]"
+  for pr in "$@"; do
+    item="$(merge_ref "$dir" "refs/pullheads/${pr}" "$pr" "$mode")"
+    array="$(jq -c --argjson item "$item" '. += [$item]' <<<"$array")"
+  done
+  printf '%s\n' "$array"
+}
+
+series_needs_attention() {
+  local json="$1"
+  jq -e 'map(select(.status != "clean" and .status != "already-present")) | length > 0' >/dev/null <<<"$json"
+}
+
+ensure_dbt_repo() {
+  prepare_repo "$DBT_SRC" "$DBT_REPO"
+  fetch_prs "$DBT_SRC" "${DBT_PRS[@]}" "${USER_LISTED_PRS[@]}" 16376 16274
+}
+
+ensure_driver_repo() {
+  prepare_repo "$DRIVER_SRC" "$DRIVER_REPO"
+  if [[ ${#DRIVER_PRS[@]} -gt 0 ]]; then
+    fetch_prs "$DRIVER_SRC" "${DRIVER_PRS[@]}"
+  fi
+}
+
+echo "fetching dbt-labs/dbt and pull heads"
+ensure_dbt_repo
+
+onto_items="[]"
+pr=""
+for pr in "${DBT_PRS[@]}"; do
+  echo "probe engine PR ${pr} onto main"
+  item="$(merge_series "$DBT_SRC" probe "$pr")"
+  # merge_series returns an array of one object
+  onto_items="$(jq -c --argjson item "$item" '. += $item' <<<"$onto_items")"
+done
+
+echo "merging engine stack: ${DBT_PRS[*]}"
+stack_json="$(merge_series "$DBT_SRC" stack "${DBT_PRS[@]}")"
+# Keep the stack checkout. merge_series leaves e2e-series on the result.
+gitc "$DBT_SRC" branch -f e2e-stack HEAD
+
+echo "merging the user-listed PR set onto main"
+user_json="$(merge_series "$DBT_SRC" stack "${USER_LISTED_PRS[@]}")"
+
+without_exec=(16274 16365 16367 16368 16369 16374 16370 16375)
+echo "merging the stack without Part 6 (#16376)"
+noexec_json="$(merge_series "$DBT_SRC" stack "${without_exec[@]}")"
+
+# Restore the default stack for a possible compile.
+gitc "$DBT_SRC" checkout --force e2e-stack >/dev/null
+
+driver_onto="[]"
+driver_stack="[]"
+driver_main=""
+if [[ "$skip_driver" -eq 0 ]]; then
+  echo "fetching dbt-labs/athena"
+  ensure_driver_repo
+  driver_main="$(gitc "$DRIVER_SRC" rev-parse origin/main)"
+  if [[ ${#DRIVER_PRS[@]} -gt 0 ]]; then
+    for pr in "${DRIVER_PRS[@]}"; do
+      echo "probe driver PR ${pr} onto main"
+      item="$(merge_series "$DRIVER_SRC" probe "$pr")"
+      driver_onto="$(jq -c --argjson item "$item" '. += $item' <<<"$driver_onto")"
+    done
+    echo "merging driver stack: ${DRIVER_PRS[*]}"
+    driver_stack="$(merge_series "$DRIVER_SRC" stack "${DRIVER_PRS[@]}")"
+    gitc "$DRIVER_SRC" branch -f e2e-stack HEAD
+  else
+    driver_stack="[]"
+    gitc "$DRIVER_SRC" checkout --force -B e2e-stack origin/main >/dev/null
+  fi
+fi
+
+dbt_main="$(gitc "$DBT_SRC" rev-parse origin/main)"
+jq -n \
+  --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg dbt_main "$dbt_main" \
+  --arg driver_main "$driver_main" \
+  --argjson dbt_prs "$(printf '%s\n' "${DBT_PRS[@]}" | jq -R . | jq -s 'map(tonumber)')" \
+  --argjson onto "$onto_items" \
+  --argjson stack "$stack_json" \
+  --argjson user_listed "$user_json" \
+  --argjson without_execution "$noexec_json" \
+  --argjson driver_onto "$driver_onto" \
+  --argjson driver_stack "$driver_stack" \
+  '{
+    generated_at: $generated_at,
+    dbt: {
+      repo: "dbt-labs/dbt",
+      main: $dbt_main,
+      merge_order: $dbt_prs,
+      onto_main: $onto,
+      stack: $stack,
+      user_listed_stack: $user_listed,
+      stack_without_execution: $without_execution
+    },
+    driver: {
+      repo: "dbt-labs/athena",
+      main: $driver_main,
+      onto_main: $driver_onto,
+      stack: $driver_stack
+    }
+  }' >"$REPORT"
+echo "wrote ${REPORT}"
+
+stack_bad=0
+if series_needs_attention "$stack_json"; then
+  stack_bad=1
+fi
+driver_bad=0
+if [[ "$driver_stack" != "[]" ]] && series_needs_attention "$driver_stack"; then
+  driver_bad=1
+fi
+
+if [[ "$merge_only" -eq 1 ]]; then
+  if [[ "$stack_bad" -eq 1 || "$driver_bad" -eq 1 ]]; then
+    echo "merge report has conflicts or -X theirs resolutions; not compiling (--merge-only)" >&2
+    exit 2
+  fi
+  echo "merges are clean"
+  exit 0
+fi
+
+if [[ "$stack_bad" -eq 1 || "$driver_bad" -eq 1 ]]; then
+  if [[ "$allow_resolved" -eq 0 ]]; then
+    echo "error: a merge failed or needed -X theirs. See ${REPORT}. Re-run with --allow-resolved to compile anyway." >&2
+    exit 2
+  fi
+  echo "warning: compiling a tree that needed conflict resolution"
+fi
+
+if [[ "$force" -eq 0 && -z "$binary_path" && -x "${DIST}/dbt" && -f "${DIST}/lib/libadbc_driver_athena.so" ]]; then
+  echo "cached binary and driver are present; pass --force to rebuild"
+  echo "dbt: ${DIST}/dbt"
+  echo "driver: ${DIST}/lib/libadbc_driver_athena.so"
+  exit 0
+fi
+echo "building (force=${force})"
+
+mkdir -p "${DIST}/lib"
+
+install_driver_next_to() {
+  local bin="$1"
+  local so="$2"
+  local dest
+  dest="$(cd "$(dirname "$bin")" && pwd)/lib"
+  mkdir -p "$dest"
+  cp "$so" "${dest}/libadbc_driver_athena.so"
+  echo "driver installed at ${dest}/libadbc_driver_athena.so"
+}
+
+if [[ -n "$binary_path" ]]; then
+  [[ -x "$binary_path" ]] || { echo "error: binary is not executable: ${binary_path}" >&2; exit 1; }
+  cp "$binary_path" "${DIST}/dbt"
+  chmod +x "${DIST}/dbt"
+  echo "using existing binary ${binary_path}"
+else
+  need_cmd curl
+  export RUSTUP_HOME="${CACHE_DIR}/rustup"
+  export CARGO_HOME="${CACHE_DIR}/cargo"
+  if [[ ! -x "${CARGO_HOME}/bin/rustup" ]]; then
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain 1.96.0 --profile minimal --no-modify-path
+  fi
+  # shellcheck disable=SC1091
+  source "${CARGO_HOME}/env"
+  rustup toolchain install 1.96.0 --profile minimal -c rustfmt -c clippy
+  echo "compiling dbt (cargo build --release -p dbt-sa-cli --bin dbt)"
+  cargo build --manifest-path "${DBT_SRC}/Cargo.toml" --release -p dbt-sa-cli --bin dbt
+  cp "${DBT_SRC}/target/release/dbt" "${DIST}/dbt"
+  chmod +x "${DIST}/dbt"
+fi
+
+if [[ -n "$driver_lib" ]]; then
+  [[ -f "$driver_lib" ]] || { echo "error: driver library not found: ${driver_lib}" >&2; exit 1; }
+  cp "$driver_lib" "${DIST}/lib/libadbc_driver_athena.so"
+elif [[ "$skip_driver" -eq 0 ]]; then
+  need_cmd curl
+  gomod="${DRIVER_SRC}/go/go.mod"
+  go_need="$(sed -n 's/^go //p' "$gomod" | head -n 1)"
+  if ! command -v go >/dev/null 2>&1 || ! go version | grep -q "go${go_need}"; then
+    sdk="${CACHE_DIR}/go-sdk"
+    tarball="${CACHE_DIR}/go${go_need}.linux-amd64.tar.gz"
+    if [[ ! -x "${sdk}/bin/go" ]] || ! "${sdk}/bin/go" version | grep -q "go${go_need}"; then
+      echo "downloading Go ${go_need}"
+      curl -fsSL -o "$tarball" "https://go.dev/dl/go${go_need}.linux-amd64.tar.gz"
+      rm -rf "$sdk" "${CACHE_DIR}/go"
+      tar -C "${CACHE_DIR}" -xzf "$tarball"
+      mv "${CACHE_DIR}/go" "$sdk"
+    fi
+    export PATH="${sdk}/bin:${PATH}"
+  fi
+  need_cmd gcc
+  echo "building libadbc_driver_athena.so (cd go/pkg && make)"
+  make -C "${DRIVER_SRC}/go/pkg"
+  cp "${DRIVER_SRC}/go/pkg/libadbc_driver_athena.so" "${DIST}/lib/libadbc_driver_athena.so"
+fi
+
+if [[ -n "$binary_path" && -f "${DIST}/lib/libadbc_driver_athena.so" ]]; then
+  install_driver_next_to "$binary_path" "${DIST}/lib/libadbc_driver_athena.so" || {
+    echo "could not write next to ${binary_path}; the built library is ${DIST}/lib/libadbc_driver_athena.so" >&2
+    exit 1
+  }
+fi
+
+cat >"${DIST}/README.txt" <<EOF
+dbt binary: ${DIST}/dbt
+driver:     ${DIST}/lib/libadbc_driver_athena.so
+The loader looks for lib/ next to the binary, then up to five parent directories.
+EOF
+
+echo "dbt: ${DIST}/dbt"
+echo "driver: ${DIST}/lib/libadbc_driver_athena.so"
