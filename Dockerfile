@@ -82,6 +82,7 @@ RUN apt-get update \
       ca-certificates \
       curl \
       git \
+      jq \
       build-essential \
       pkg-config \
       libssl-dev \

@@ -11,6 +11,7 @@ source "${SCRIPT_DIR}/pins.sh"
 e2e_load_pins "$ROOT"
 
 command -v docker >/dev/null 2>&1 || { echo "error: docker is required" >&2; exit 1; }
+export DOCKER_BUILDKIT=1
 
 build_args=()
 while IFS= read -r line || [[ -n "$line" ]]; do
